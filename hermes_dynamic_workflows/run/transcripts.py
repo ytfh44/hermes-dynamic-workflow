@@ -367,6 +367,9 @@ class LiveTranscriptExporter:
     ) -> None:
         with self._lock:
             target = self._targets.get(session_id)
+            previous_metadata = dict(target.metadata) if target is not None else None
+            previous_transcript_path = target.transcript_path if target is not None else None
+            previous_meta_path = target.meta_path if target is not None else None
             was_active = target.active if target is not None else None
             if target is None:
                 target = LiveTranscriptTarget(
@@ -382,18 +385,42 @@ class LiveTranscriptExporter:
                 target.meta_path = meta_path
                 target.metadata = dict(metadata)
                 target.active = active
-        # Write a newly discovered child immediately. When it becomes terminal,
-        # do one last refresh before removing it from periodic polling.
-        if was_active is None or (was_active and not active):
+        # Write a newly discovered child immediately; when its metadata or
+        # paths change, flush right away too; and when it becomes terminal, do
+        # one last refresh before removing it from periodic polling.
+        previous_metadata = {
+            key: value
+            for key, value in (previous_metadata or {}).items()
+            if key != "updated_at"
+        }
+        current_metadata = {
+            key: value for key, value in metadata.items() if key != "updated_at"
+        }
+        metadata_or_paths_changed = (
+            previous_metadata != current_metadata
+            or previous_transcript_path != transcript_path
+            or previous_meta_path != meta_path
+        )
+        if was_active is None or (was_active and not active) or metadata_or_paths_changed:
             self.flush(session_ids=[session_id])
 
-    def stop(self, *, final: bool = True) -> None:
+    def stop(self, *, final: bool = True, flush_timeout: float = 30.0) -> None:
+        """Stop the exporter, optionally flushing every target one last time.
+
+        If the final flush cannot acquire the flush lock within `flush_timeout`
+        seconds (a wedged flush is holding it), the final flush is abandoned
+        but the reader is still closed, so the caller never blocks forever.
+        """
         self._stop.set()
         if self._thread.is_alive() and threading.current_thread() is not self._thread:
             self._thread.join(timeout=2)
         if final:
-            self.flush(force_rebuild=True)
-            self._reader.close()
+            try:
+                self.flush(force_rebuild=True, timeout=flush_timeout)
+            except TimeoutError:
+                pass
+            finally:
+                self._reader.close()
 
     def flush(
         self,
@@ -401,7 +428,14 @@ class LiveTranscriptExporter:
         session_ids: list[str] | None = None,
         active_only: bool = False,
         force_rebuild: bool = False,
+        timeout: float | None = None,
     ) -> None:
+        """Flush all (or the given) targets to disk, serialized by the flush lock.
+
+        `timeout` bounds how long to wait for the flush lock; when it expires a
+        TimeoutError is raised without writing anything. The default (None)
+        waits indefinitely, matching the pre-existing blocking behavior.
+        """
         with self._lock:
             if session_ids is None:
                 targets = list(self._targets.values())
@@ -419,12 +453,22 @@ class LiveTranscriptExporter:
         first_error: Exception | None = None
         # One reader and one writer at a time per workflow. This avoids N
         # concurrent SQLite connections and atomic-temp-file races.
-        with self._flush_lock:
+        if timeout is None:
+            acquired = self._flush_lock.acquire()
+        else:
+            acquired = self._flush_lock.acquire(timeout=timeout)
+        if not acquired:
+            raise TimeoutError(
+                f"timed out after {timeout}s waiting for the transcript flush lock"
+            )
+        try:
             for session_id in target_ids:
                 try:
                     self._flush_target(session_id, force_rebuild=force_rebuild)
                 except Exception as exc:
                     first_error = first_error or exc
+        finally:
+            self._flush_lock.release()
         if first_error is not None:
             raise first_error
 
@@ -437,8 +481,10 @@ class LiveTranscriptExporter:
             meta_path = target.meta_path
             metadata = dict(target.metadata)
             previous_metadata_signature = target.metadata_signature
-
-        read = self._reader.read(target, force_rebuild=force_rebuild)
+            # The reader mutates the target (export mode, lineage, signatures);
+            # read under the same lock that guards the snapshot and write-back
+            # so upsert can never observe a partially-refreshed target.
+            read = self._reader.read(target, force_rebuild=force_rebuild)
         metadata["transcript_export_mode"] = read.export_mode
         metadata["transcript_lineage_session_ids"] = list(read.lineage_session_ids)
         if read.fallback_reason:

@@ -9,6 +9,7 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -20,6 +21,7 @@ from hermes_dynamic_workflows.run import manager as manager_module
 from hermes_dynamic_workflows.run import transcripts as transcripts_module
 from hermes_dynamic_workflows.run.transcripts import (
     LiveTranscriptExporter,
+    LiveTranscriptTarget,
     SessionTranscriptReader,
 )
 from hermes_dynamic_workflows.run.manager import (
@@ -1230,6 +1232,166 @@ return await agent("do it", {"label": "worker"})
                 meta = json.loads(meta_path.read_text(encoding="utf-8"))
                 self.assertEqual(meta["agent_status"], "done")
                 self.assertEqual(meta["transcript_export_mode"], "incremental")
+
+    def test_live_transcript_exporter_upsert_metadata_change_flushes_immediately(self):
+        """A metadata-only upsert (active unchanged) flushes at once instead of
+        waiting for the next poll, while a pure `updated_at` bump flushes
+        nothing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = IncrementalTestDB()
+            db.create_session("meta-session")
+            db.append_message("meta-session", "user", "hello")
+            reader = RecordingSessionTranscriptReader(db)
+            exporter = LiveTranscriptExporter(
+                run_id="wf_meta-flush-test",
+                interval_seconds=60,
+                reader=reader,
+            )
+            session_id = "meta-session"
+            transcript_path = root / f"agent-{session_id}.jsonl"
+            meta_path = transcript_path.with_suffix(".meta.json")
+            exporter.upsert(
+                session_id=session_id,
+                transcript_path=transcript_path,
+                meta_path=meta_path,
+                metadata={"session_id": session_id, "agent_status": "running"},
+                active=True,
+            )
+            self.assertIn("running", meta_path.read_text(encoding="utf-8"))
+
+            reader.clear_reads()
+            exporter.upsert(
+                session_id=session_id,
+                transcript_path=transcript_path,
+                meta_path=meta_path,
+                metadata={"session_id": session_id, "agent_status": "done"},
+                active=True,
+            )
+            self.assertIn("done", meta_path.read_text(encoding="utf-8"))
+            self.assertEqual(reader.reads, [session_id])
+
+            reader.clear_reads()
+            exporter.upsert(
+                session_id=session_id,
+                transcript_path=transcript_path,
+                meta_path=meta_path,
+                metadata={"session_id": session_id, "agent_status": "done", "updated_at": "t1"},
+                active=True,
+            )
+            self.assertEqual(reader.reads, [])
+            exporter.stop(final=True)
+
+    def test_live_transcript_exporter_concurrent_upsert_during_flush_stays_consistent(self):
+        """An upsert racing an in-flight flush never loses its metadata: the
+        final meta file and the stored target signature must agree."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = IncrementalTestDB()
+            db.create_session("race-session")
+            db.append_message("race-session", "user", "hello")
+            in_read = threading.Event()
+            release = threading.Event()
+            read_count = {"n": 0}
+
+            class BlockingReader(SessionTranscriptReader):
+                def read(self, target, *, force_rebuild=False):
+                    read_count["n"] += 1
+                    if read_count["n"] == 2:
+                        in_read.set()
+                        release.wait(timeout=5)
+                    return super().read(target, force_rebuild=force_rebuild)
+
+            exporter = LiveTranscriptExporter(
+                run_id="wf_race-test",
+                interval_seconds=60,
+                reader=BlockingReader(db=db),
+            )
+            session_id = "race-session"
+            transcript_path = root / f"agent-{session_id}.jsonl"
+            meta_path = transcript_path.with_suffix(".meta.json")
+            exporter.upsert(
+                session_id=session_id,
+                transcript_path=transcript_path,
+                meta_path=meta_path,
+                metadata={"session_id": session_id, "agent_status": "running"},
+                active=True,
+            )
+            errors: list[Exception] = []
+
+            def run_flush() -> None:
+                try:
+                    exporter.flush(active_only=True)
+                except Exception as exc:
+                    errors.append(exc)
+
+            def run_upsert() -> None:
+                try:
+                    exporter.upsert(
+                        session_id=session_id,
+                        transcript_path=transcript_path,
+                        meta_path=meta_path,
+                        metadata={"session_id": session_id, "agent_status": "done"},
+                        active=True,
+                    )
+                except Exception as exc:
+                    errors.append(exc)
+
+            flusher = threading.Thread(target=run_flush)
+            flusher.start()
+            self.assertTrue(in_read.wait(timeout=5))
+            updater = threading.Thread(target=run_upsert)
+            updater.start()
+            release.set()
+            flusher.join(timeout=10)
+            updater.join(timeout=10)
+            self.assertFalse(flusher.is_alive())
+            self.assertFalse(updater.is_alive())
+            self.assertEqual(errors, [])
+            on_disk = json.loads(meta_path.read_text(encoding="utf-8"))
+            self.assertEqual(on_disk["agent_status"], "done")
+            self.assertEqual(
+                exporter._targets[session_id].metadata_signature,
+                transcripts_module._json_signature(
+                    {key: value for key, value in on_disk.items() if key != "updated_at"}
+                ),
+            )
+
+    def test_live_transcript_exporter_stop_times_out_when_flush_lock_wedged(self):
+        """stop() must not block forever when another flush holds the flush
+        lock; it abandons the final flush and still closes the reader."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            closed: list[bool] = []
+
+            class WedgedReader:
+                def read(self, target, *, force_rebuild=False):
+                    raise AssertionError("read must not run when the flush is wedged")
+
+                def close(self):
+                    closed.append(True)
+
+            exporter = LiveTranscriptExporter(
+                run_id="wf_stop-timeout-test",
+                interval_seconds=60,
+                reader=WedgedReader(),
+            )
+            exporter._targets["wedged-session"] = LiveTranscriptTarget(
+                session_id="wedged-session",
+                transcript_path=root / "agent-wedged-session.jsonl",
+                meta_path=root / "agent-wedged-session.meta.json",
+                metadata={},
+                active=True,
+            )
+            exporter._flush_lock.acquire()
+            try:
+                started = time.monotonic()
+                exporter.stop(final=True, flush_timeout=0.2)
+                elapsed = time.monotonic() - started
+            finally:
+                exporter._flush_lock.release()
+            self.assertLess(elapsed, 5.0)
+            self.assertEqual(closed, [True])
 
     def test_completion_exports_child_transcripts_after_run(self):
         script = """
