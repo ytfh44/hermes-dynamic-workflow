@@ -5,6 +5,8 @@ import os
 import io
 import subprocess
 import tempfile
+import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -30,7 +32,7 @@ from hermes_dynamic_workflows.child.runner import (
 )
 from hermes_dynamic_workflows.child.worktree import WorkspaceLease, create_workspace_lease
 from hermes_dynamic_workflows.core.config import PluginConfig
-from hermes_dynamic_workflows.core.errors import ChildAgentError
+from hermes_dynamic_workflows.core.errors import ChildAgentError, WorkflowTimeout
 from hermes_dynamic_workflows.core.types import ChildAgentRequest
 from hermes_dynamic_workflows.child.structured_output import (
     MAX_STRUCTURED_OUTPUT_RETRIES,
@@ -961,6 +963,62 @@ class StructuredOutputContinuationTests(unittest.TestCase):
             )
 
         self.assertTrue(child.closed)
+
+    def test_runner_waits_for_worker_to_finish_before_close_on_timeout(self):
+        """On child timeout the runner must interrupt first, then wait for the
+        worker thread to exit its run_conversation turn, and only then close the
+        child — never close while the worker may still touch the child."""
+        events: list[str] = []
+        release = threading.Event()
+        worker_done = threading.Event()
+
+        class Child:
+            session_prompt_tokens = 0
+            session_completion_tokens = 0
+            session_reasoning_tokens = 0
+            session_cache_read_tokens = 0
+            session_cache_write_tokens = 0
+            model = "test"
+
+            def run_conversation(self, **_):
+                events.append("run")
+                release.wait(timeout=5)
+                # Simulate the worker's post-interrupt wind-down (e.g. finishing
+                # the current LLM/tool turn) before it returns.
+                time.sleep(0.1)
+                events.append("run-exit")
+                worker_done.set()
+                return {"final_response": "done", "messages": [], "completed": True}
+
+            def interrupt(self):
+                events.append("interrupt")
+                release.set()
+
+            def close(self):
+                events.append("close")
+
+        request = ChildAgentRequest(
+            id=1,
+            prompt="work",
+            label="worker",
+            phase=None,
+            toolsets=[],
+        )
+        lease = WorkspaceLease(task_id="timing-out-child", cwd="/tmp")
+        child = Child()
+        runner = HermesChildAgentRunner(PluginConfig(child_timeout_seconds=0.05))
+
+        with self.assertRaises(WorkflowTimeout):
+            runner._run_child_with_timeout(child, request, lease, None, [])
+
+        self.assertTrue(worker_done.wait(timeout=2), "worker never finished its turn")
+        self.assertEqual(events[0], "run")
+        self.assertIn("interrupt", events)
+        self.assertGreater(
+            events.index("close"),
+            events.index("run-exit"),
+            "child.close() must run after the worker exited its run_conversation turn",
+        )
 
     def test_runner_fails_after_maximum_missing_submissions(self):
         schema = {"type": "object"}

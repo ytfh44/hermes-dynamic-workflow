@@ -1581,6 +1581,74 @@ return await agent("do it", {"label": "worker"})
                     transcripts_module._write_text_atomic(target, "data\n")
             self.assertFalse(list(root.glob("*.tmp")))
 
+    def test_load_session_messages_closes_db_after_success(self):
+        """_load_session_messages must close the ad-hoc session DB connection it
+        opens, even on the success path."""
+        db = ClosingSessionDB()
+
+        with patch(
+            "hermes_dynamic_workflows.host.session.create_session_db",
+            return_value=db,
+        ):
+            result = transcripts_module._load_session_messages("wf_close-on-success")
+
+        self.assertEqual(result, [{"id": 1, "session_id": "wf_close-on-success"}])
+        self.assertTrue(db.closed)
+
+    def test_load_session_messages_closes_db_after_error(self):
+        """_load_session_messages must close the ad-hoc session DB connection it
+        opens, even when reading messages fails."""
+        db = ExplodingSessionDB()
+
+        with patch(
+            "hermes_dynamic_workflows.host.session.create_session_db",
+            return_value=db,
+        ):
+            result = transcripts_module._load_session_messages("wf_close-on-error")
+
+        self.assertEqual(result, [])
+        self.assertTrue(db.closed)
+
+    def test_load_session_messages_tolerates_db_without_close(self):
+        """The defensive close must not crash when a session DB exposes no close
+        method (fake/stub implementations)."""
+        db = NoCloseSessionDB()
+
+        with patch(
+            "hermes_dynamic_workflows.host.session.create_session_db",
+            return_value=db,
+        ):
+            result = transcripts_module._load_session_messages("wf_no-close")
+
+        self.assertEqual(result, [{"id": 2, "session_id": "wf_no-close"}])
+
+
+class ClosingSessionDB:
+    def __init__(self):
+        self.closed = False
+
+    def get_messages(self, session_id, include_inactive=False):
+        return [{"id": 1, "session_id": session_id}]
+
+    def close(self):
+        self.closed = True
+
+
+class ExplodingSessionDB:
+    def __init__(self):
+        self.closed = False
+
+    def get_messages(self, session_id, include_inactive=False):
+        raise RuntimeError("db read failed")
+
+    def close(self):
+        self.closed = True
+
+
+class NoCloseSessionDB:
+    def get_messages(self, session_id, include_inactive=False):
+        return [{"id": 2, "session_id": session_id}]
+
 
 if __name__ == "__main__":
     unittest.main()

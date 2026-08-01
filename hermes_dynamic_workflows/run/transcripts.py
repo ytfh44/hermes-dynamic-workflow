@@ -702,12 +702,21 @@ def _append_unique(items: Any, value: str) -> None:
 
 
 def _load_session_messages(session_id: str) -> list[dict[str, Any]]:
+    db = None
     try:
         from ..host import session as host_session
 
-        return host_session.create_session_db().get_messages(session_id, include_inactive=True)
+        db = host_session.create_session_db()
+        return db.get_messages(session_id, include_inactive=True)
     except Exception:
         return []
+    finally:
+        # Each call opens its own ad-hoc session DB connection; it must be closed
+        # on both the success and the failure path. Defensive getattr: host stubs
+        # or fakes may not expose a close() method.
+        close_db = getattr(db, "close", None)
+        if callable(close_db):
+            close_db()
 
 
 def _iter_agent_snapshots(snapshot: dict[str, Any]):

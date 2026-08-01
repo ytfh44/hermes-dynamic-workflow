@@ -43,6 +43,12 @@ logger = logging.getLogger(__name__)
 
 _CHILD_EXCLUDED_TOOL_NAMES = frozenset({"skill_manage"})
 
+# How long the runner waits for the worker thread to leave its run_conversation
+# turn after interrupt() before giving up on it. interrupt() is an async request:
+# the worker finishes the current LLM/tool call (typically ms to a second or so),
+# and close() must not run while the worker may still touch the child.
+INTERRUPT_GRACE_SECONDS = 5.0
+
 
 class _WorkflowApprovalCoordinator:
     """Serialize workflow-child CLI approvals and reuse explicit session grants."""
@@ -520,6 +526,17 @@ class HermesChildAgentRunner(ChildAgentRunner):
             try:
                 if hasattr(child, "interrupt"):
                     child.interrupt()
+                # interrupt() is only a request: the worker thread leaves its
+                # run_conversation turn once the current LLM/tool call returns.
+                # Wait a bounded grace period so that close() in the outer finally
+                # runs only after the worker stopped touching the child — closing
+                # it earlier would race an in-flight turn and leak the worker thread.
+                try:
+                    future.result(timeout=INTERRUPT_GRACE_SECONDS)
+                except FuturesTimeoutError:
+                    pass
+                except Exception:
+                    pass
             finally:
                 raise WorkflowTimeout(f"child agent timed out after {timeout:.0f}s") from exc
         finally:
