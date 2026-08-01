@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -117,6 +118,46 @@ class WorkflowStore:
         tmp = path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
         tmp.replace(path)
+        self._bump_version()
+
+    def world_version(self) -> int:
+        """Monotonic change token for the runs directory.
+
+        Incremented on every save_run and persisted atomically, so readers in
+        another process (e.g. the TUI) can detect add/rewrite cheaply and
+        reliably — unlike directory mtimes, this is independent of filesystem
+        timestamp granularity.
+        """
+        return self._read_version()
+
+    def _version_path(self) -> Path:
+        """Path of the persisted version counter, kept inside runs_dir so it
+        lives (and is atomically replaced) on the same volume as run files."""
+        return self.runs_dir / ".version"
+
+    def _read_version(self) -> int:
+        """Read the persisted version, returning 0 when absent or corrupt."""
+        try:
+            return int(self._version_path().read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            return 0
+
+    def _write_version(self, version: int) -> None:
+        """Atomically persist the version via tmp+rename."""
+        tmp = self.runs_dir / ".version.tmp"
+        tmp.write_text(str(version), encoding="utf-8")
+        tmp.replace(self._version_path())
+
+    def _bump_version(self) -> int:
+        """Compute and persist the next strictly-larger version, returning it.
+
+        The value is the max of the previous version + 1 and the wall-clock ns,
+        so consecutive saves are strictly increasing even when two processes
+        bump concurrently (their clock ns differ) or the clock jumps backwards.
+        """
+        version = max(self._read_version() + 1, time.time_ns())
+        self._write_version(version)
+        return version
 
     def load_run(self, run_id: str) -> dict[str, Any] | None:
         path = self.run_path(run_id)

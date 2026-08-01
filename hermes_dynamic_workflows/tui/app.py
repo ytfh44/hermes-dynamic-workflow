@@ -356,7 +356,7 @@ def _run_curses(screen: Any, controller: TuiController, curses: Any) -> None:
                 last_version = controller.repository.world_version()
                 dirty = True
             else:
-                # idle: O(1) dir-mtime check; only reload when something changed
+                # idle: O(1) version check; only reload when something changed
                 version = controller.repository.world_version()
                 if version != last_version:
                     last_version = version

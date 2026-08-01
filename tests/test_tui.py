@@ -5,7 +5,6 @@ import os
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -142,6 +141,8 @@ class TuiTests(unittest.TestCase):
             record = original("wf_fake-completed")
             assert record is not None
             calls.clear()
+            # Rewrite with different content so the signature cannot collide.
+            record["summary"] = record["summary"] + " — updated"
             store.save_run(record)
             repository.load()
             self.assertIn("wf_fake-completed", calls)
@@ -168,11 +169,68 @@ class TuiTests(unittest.TestCase):
             store = _fake_store(Path(tmp))
             repo = WorkflowRepository(store)
             before = repo.world_version()
-            time.sleep(0.01)
             record = store.load_run("wf_fake-running")
             assert record is not None
-            store.save_run(record)  # tmp+rename bumps the runs-dir mtime
-            self.assertNotEqual(repo.world_version(), before)
+            store.save_run(record)  # every save_run bumps the persisted version
+            self.assertGreater(repo.world_version(), before)
+
+    def test_save_run_bumps_version_even_for_identical_content(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _fake_store(Path(tmp))
+            record = store.load_run("wf_fake-completed")
+            assert record is not None
+            before = store.world_version()
+            store.save_run(record)
+            self.assertGreater(store.world_version(), before)
+
+    def test_world_version_persists_across_store_instances(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _fake_store(Path(tmp))
+            before = store.world_version()
+            record = store.load_run("wf_fake-running")
+            assert record is not None
+            store.save_run(record)
+            self.assertGreater(store.world_version(), before)
+            reopened = WorkflowStore(Path(tmp))
+            self.assertEqual(reopened.world_version(), store.world_version())
+
+    def test_world_version_is_monotonic_across_consecutive_saves(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _fake_store(Path(tmp))
+            record = store.load_run("wf_fake-running")
+            assert record is not None
+            versions = [store.world_version()]
+            for _ in range(3):
+                store.save_run(record)
+                versions.append(store.world_version())
+            self.assertEqual(versions, sorted(versions))
+            self.assertEqual(len(set(versions)), len(versions))
+
+    def test_world_version_survives_missing_or_corrupt_version_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = WorkflowStore(Path(tmp))
+            self.assertEqual(store.world_version(), 0)
+            version_file = store.runs_dir / ".version"
+            version_file.write_text("not-a-number", encoding="utf-8")
+            self.assertEqual(store.world_version(), 0)
+            store.save_run({"runId": "wf_new12345", "status": "running"})
+            self.assertGreater(store.world_version(), 0)
+
+    def test_repository_reloads_terminal_run_after_identical_content_rewrite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _fake_store(Path(tmp))
+            calls: list[str] = []
+            original = store.load_run
+            store.load_run = lambda run_id: (calls.append(run_id), original(run_id))[1]
+            repository = WorkflowRepository(store)
+            repository.load()
+            self.assertEqual(calls.count("wf_fake-completed"), 1)
+            record = original("wf_fake-completed")
+            assert record is not None
+            calls.clear()
+            store.save_run(record)  # byte-identical rewrite must still invalidate
+            repository.load()
+            self.assertEqual(calls.count("wf_fake-completed"), 1)
 
     def test_right_arrow_on_run_opens_workflow(self):
         with tempfile.TemporaryDirectory() as tmp:

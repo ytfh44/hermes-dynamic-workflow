@@ -199,23 +199,22 @@ class WorkflowRepository:
         self._detail_cache: dict[str, tuple[tuple[int, int], WorkflowView]] = {}
 
     def world_version(self) -> int:
-        """O(1) change token: the runs dir mtime bumps on every save_run (it
-        writes via tmp+rename), so this detects add/remove/rewrite at any scale."""
-        try:
-            return self.store.runs_dir.stat().st_mtime_ns
-        except OSError:
-            return 0
+        """O(1) change token: a monotonic counter the store persists and bumps
+        on every save_run, so this detects add/remove/rewrite at any scale
+        without depending on filesystem timestamp granularity."""
+        return self.store.world_version()
 
     def load(self, limit: int = 50) -> list[WorkflowView]:
         views: list[WorkflowView] = []
         seen: set[str] = set()
+        version = self.store.world_version()
         for path in self.store.list_run_paths(limit=limit):
             run_id = path.stem
             try:
                 stat = path.stat()
             except OSError:
                 continue
-            signature = (stat.st_mtime_ns, stat.st_size)
+            signature = (version, stat.st_size)
             cached = self._view_cache.get(run_id)
             if cached is not None and cached[0] == signature:
                 seen.add(run_id)
@@ -239,7 +238,7 @@ class WorkflowRepository:
             stat = self.store.run_path(run_id).stat()
         except (OSError, ValueError):
             return None
-        signature = (stat.st_mtime_ns, stat.st_size)
+        signature = (self.store.world_version(), stat.st_size)
         cached = self._detail_cache.get(run_id)
         if cached is not None and cached[0] == signature:
             return cached[1]
