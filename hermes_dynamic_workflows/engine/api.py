@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import inspect
+import json
+import re
 import threading
 from pathlib import Path
 from time import monotonic
@@ -15,6 +17,7 @@ from ..core.text import preview
 from ..core.errors import (
     ChildAgentError,
     ChildAgentSkipped,
+    GateBlocked,
     WorkflowHalt,
     WorkflowParseError,
     WorkflowRuntimeError,
@@ -66,6 +69,7 @@ class WorkflowAPI:
     def globals(self) -> dict[str, Any]:
         return {
             "agent": self.agent,
+            "gate": self.gate,
             "parallel": self.parallel,
             "pipeline": self.pipeline,
             "phase": self.phase,
@@ -75,10 +79,28 @@ class WorkflowAPI:
             "workflow": self.workflow,
         }
 
-    async def agent(self, prompt: str, opts: dict[str, Any] | None = None) -> Any:
-        return await asyncio.to_thread(self._agent_sync, prompt, opts)
+    async def agent(
+        self,
+        prompt: str,
+        opts: dict[str, Any] | None = None,
+        _on_agent_id: Callable[[int], None] | None = None,
+    ) -> Any:
+        """Run a child agent and return its result.
 
-    def _agent_sync(self, prompt: str, opts: dict[str, Any] | None = None) -> Any:
+        ``_on_agent_id`` is an internal hook: when provided, it is invoked
+        with the id of the agent this call creates, atomically with the
+        agent-record append while the frame lock is held. The callback runs
+        under that lock and must not re-enter it. ``gate()`` uses it to learn
+        the governed agent's id without racing concurrent ``agent()`` calls.
+        """
+        return await asyncio.to_thread(self._agent_sync, prompt, opts, _on_agent_id)
+
+    def _agent_sync(
+        self,
+        prompt: str,
+        opts: dict[str, Any] | None = None,
+        _on_agent_id: Callable[[int], None] | None = None,
+    ) -> Any:
         self._check_deadline()
         opts = opts or {}
         if not isinstance(prompt, str) or not prompt.strip():
@@ -118,6 +140,8 @@ class WorkflowAPI:
                 model=resolved.model,
             )
             self.frame.agents.append(record)
+            if _on_agent_id is not None:
+                _on_agent_id(agent_id)
             self._notify()
 
         fingerprint = agent_fingerprint(
@@ -291,6 +315,192 @@ class WorkflowAPI:
                 self._notify()
         raise ChildAgentError("child agent failed without a result")
 
+    async def gate(self, prompt: str, opts: dict[str, Any] | None = None) -> Any:
+        """Run a child agent and block its result unless it passes a quality gate.
+
+        ``gate()`` is ``agent()`` with an enforced quality gate. It runs
+        ``await agent(prompt, opts)`` with every ``opts`` key except ``check``
+        and ``judge`` forwarded unchanged (the same option validation,
+        resume-cache, journaling, token accounting, and deadline checks apply).
+        Then, in order:
+
+        * ``check`` — a zero-token, pure-data check that never spends LLM
+          budget. A single dict with exactly one form: ``contains`` /
+          ``not_contains`` / ``regex`` (a substring or pattern the result text
+          must / must not match) or ``field`` + ``equals`` (a key in a
+          structured-output dict whose value must equal ``equals``). If the
+          check fails, raises ``GateBlocked`` without consulting the LLM.
+        * ``judge: True`` — an LLM judge. Re-runs ``prompt`` as a fresh child
+          agent with the structured verdict schema ``_GATE_JUDGE_SCHEMA``
+          (``{"verdict": "PASS"|"BLOCK", "reason": str}``). Any verdict other
+          than ``PASS``, or any judge run that fails to produce a valid
+          structured verdict, raises ``GateBlocked`` (fail-closed). Judge
+          verdicts are cached under a ``gate:``-prefixed fingerprint keyed by
+          prompt, check config, model, agentType, and isolation, so a repeat
+          call with the same gate configuration reuses the cached verdict
+          instead of re-spending tokens.
+
+        ``GateBlocked`` is a recoverable ``DynamicWorkflowError`` — a script
+        can wrap ``gate()`` in ``try/except Exception`` and degrade gracefully.
+        Passing neither ``check`` nor ``judge`` makes ``gate()`` behave exactly
+        like ``agent()``.
+
+        Every ``gate()`` call that carries a ``check`` or ``judge`` emits
+        exactly one journal event after the final verdict:
+        ``{"type": "gate", "key", "agentId", "verdict": "PASS"|"BLOCK",
+        "mode": "check"|"llm", "reason", "check"}``. ``mode`` is ``"check"``
+        for a zero-token check outcome and ``"llm"`` for a judge outcome,
+        ``key`` is the ``gate:``-prefixed gate fingerprint (also the judge's
+        resume-cache key), and ``agentId`` is the governed child agent's id,
+        so the TUI renders the verdict under that agent's activity. A call
+        with neither ``check`` nor ``judge`` emits nothing.
+
+        Args:
+            prompt: The child-agent prompt (same contract as ``agent()``).
+            opts: ``agent()`` options plus the gate-only keys ``check`` and
+                ``judge``. Unknown keys are forwarded to ``agent()`` and
+                rejected there.
+
+        Returns:
+            The underlying ``agent()`` result when the gate passes.
+
+        Raises:
+            GateBlocked: A zero-token check failed, or the LLM judge returned
+                a verdict other than PASS (or could not return one).
+            WorkflowRuntimeError: API misuse — bad prompt/opts, an invalid
+                ``check`` config, or a ``judge`` value other than ``True``.
+        """
+        self._check_deadline()
+        opts = opts or {}
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise WorkflowRuntimeError("gate() expects a non-empty prompt string")
+        if not isinstance(opts, dict):
+            raise WorkflowRuntimeError("gate() options must be a dict")
+
+        check = opts.get("check")
+        judge = opts.get("judge")
+        agent_opts = {
+            key: value for key, value in opts.items() if key not in ("check", "judge")
+        }
+        if check is not None:
+            _validate_gate_check(check)
+        if judge is not None and judge is not True:
+            raise WorkflowRuntimeError("gate() judge option must be True when set")
+
+        gated_id: dict[str, int] = {}
+
+        def _capture_gated_id(agent_id: int) -> None:
+            gated_id["agentId"] = agent_id
+
+        result = await self.agent(prompt, agent_opts, _on_agent_id=_capture_gated_id)
+        self._check_deadline()
+        if check is None and judge is None:
+            return result
+
+        gate_fingerprint = agent_fingerprint(
+            prompt,
+            {
+                "gate": True,
+                "check": check,
+                "model": agent_opts.get("model"),
+                "agentType": agent_opts.get("agentType"),
+                "isolation": agent_opts.get("isolation"),
+            },
+        )
+        gate_key = f"gate:{gate_fingerprint}"
+        gated_agent_id = str(gated_id.get("agentId") or "?")
+
+        if check is not None and not _gate_checks_pass(check, result):
+            reason = f"expected {_gate_check_description(check)}"
+            self._journal(
+                {
+                    "type": "gate",
+                    "key": gate_key,
+                    "agentId": gated_agent_id,
+                    "verdict": "BLOCK",
+                    "mode": "check",
+                    "reason": reason,
+                    "check": check,
+                }
+            )
+            raise GateBlocked(f"gate() check failed: {reason}")
+
+        if judge is True:
+            verdict, reason = await self._gate_judge(
+                prompt, agent_opts, check, gate_key
+            )
+            self._journal(
+                {
+                    "type": "gate",
+                    "key": gate_key,
+                    "agentId": gated_agent_id,
+                    "verdict": verdict,
+                    "mode": "llm",
+                    "reason": reason,
+                    "check": check,
+                }
+            )
+            if verdict != "PASS":
+                suffix = f": {reason}" if reason else ": verdict is not PASS"
+                raise GateBlocked(f"gate() judge blocked the result{suffix}")
+            return result
+
+        # check is not None here: the no-gate passthrough returned earlier, and
+        # the judge branch returned above, so this fall-through implies a
+        # check-only gate that passed.
+        if check is not None:
+            self._journal(
+                {
+                    "type": "gate",
+                    "key": gate_key,
+                    "agentId": gated_agent_id,
+                    "verdict": "PASS",
+                    "mode": "check",
+                    "reason": _gate_check_description(check),
+                    "check": check,
+                }
+            )
+        return result
+
+    async def _gate_judge(
+        self,
+        prompt: str,
+        agent_opts: dict[str, Any],
+        check: dict[str, Any] | None,
+        cache_key: str,
+    ) -> tuple[str, str]:
+        """Run the LLM judge for ``gate()``; return ``("PASS" | "BLOCK", reason)``.
+
+        The judge is a fresh ``agent()`` call on the same prompt with the
+        structured verdict schema ``_GATE_JUDGE_SCHEMA``. The verdict is cached
+        under ``cache_key`` — the ``gate:``-prefixed fingerprint the caller
+        already computed for the whole gate invocation — so identical gate
+        calls share a single judge run. Every failure mode is fail-closed: a
+        verdict other than ``PASS``, a non-dict or missing structured verdict,
+        or a child-agent / structured-output error inside ``agent()`` all
+        yield ``("BLOCK", reason)``; the caller journals the event and raises
+        ``GateBlocked``.
+        """
+        self._check_deadline()
+        cached = self.resume_cache.get(cache_key)
+        if is_cache_miss(cached):
+            judge_opts = {**agent_opts, "schema": _GATE_JUDGE_SCHEMA}
+            try:
+                judged = await self.agent(prompt, judge_opts)
+            except WorkflowRuntimeError as exc:
+                return "BLOCK", f"judge could not obtain a verdict: {exc}"
+            self._check_deadline()
+            self.resume_cache.put(cache_key, judged)
+        else:
+            judged = cached
+        if not isinstance(judged, dict) or judged.get("verdict") != "PASS":
+            reason = judged.get("reason") if isinstance(judged, dict) else None
+            if isinstance(reason, str) and reason.strip():
+                return "BLOCK", reason.strip()
+            return "BLOCK", ""
+        reason = judged.get("reason") if isinstance(judged, dict) else None
+        return "PASS", reason.strip() if isinstance(reason, str) else ""
+
     def _run_child(self, request: ChildAgentRequest, record: AgentRecord) -> Any:
         return self.runner.run(request)
 
@@ -416,6 +626,16 @@ class WorkflowAPI:
         self.context.journal(event)
 
 
+_GATE_JUDGE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["verdict"],
+    "properties": {
+        "verdict": {"enum": ["PASS", "BLOCK"]},
+        "reason": {"type": "string"},
+    },
+}
+
+
 _PUBLIC_AGENT_OPT_KEYS = frozenset(
     {
         "label",
@@ -440,6 +660,99 @@ def _validate_agent_opts(opts: dict[str, Any]) -> None:
         "plugin config; provider/runtime, timeout, and retry policy belong in "
         "Hermes/plugin configuration, not workflow scripts."
     )
+
+
+def _gate_text(result: Any) -> str:
+    """Render an agent result as text for the text-based zero-token checks.
+
+    Strings pass through; structured results are JSON-serialized so
+    ``contains`` / ``not_contains`` / ``regex`` can inspect them.
+    """
+    if isinstance(result, str):
+        return result
+    if isinstance(result, (dict, list)):
+        return json.dumps(result, ensure_ascii=False, sort_keys=True)
+    return str(result)
+
+
+def _gate_checks_pass(check: dict[str, Any], result: Any) -> bool:
+    """Return True when ``result`` satisfies the (already validated) ``check``.
+
+    ``contains`` / ``not_contains`` / ``regex`` match against the text form of
+    the result; ``field`` + ``equals`` compares a key of a structured-output
+    dict. A missing field or a non-dict result fails the check.
+    """
+    if "contains" in check:
+        return check["contains"] in _gate_text(result)
+    if "not_contains" in check:
+        return check["not_contains"] not in _gate_text(result)
+    if "regex" in check:
+        return re.search(check["regex"], _gate_text(result)) is not None
+    return (
+        isinstance(result, dict)
+        and check["field"] in result
+        and result[check["field"]] == check["equals"]
+    )
+
+
+def _gate_check_description(check: dict[str, Any]) -> str:
+    """Human-readable summary of a check, used in the ``GateBlocked`` message."""
+    if "contains" in check:
+        return f"contains {check['contains']!r}"
+    if "not_contains" in check:
+        return f"not_contains {check['not_contains']!r}"
+    if "regex" in check:
+        return f"regex {check['regex']!r}"
+    return f"field {check['field']!r} equals {check['equals']!r}"
+
+
+def _validate_gate_check(check: Any) -> None:
+    """Validate a ``gate()`` ``check`` config; raise ``WorkflowRuntimeError`` on misuse.
+
+    A check must be a dict with exactly one form: ``contains``,
+    ``not_contains``, or ``regex`` (each a non-empty string; ``regex`` must
+    compile), or ``field`` + ``equals`` (a non-empty field name and any JSON
+    value). Any other key combination is rejected before a child agent is
+    spawned, so a malformed gate fails fast and spends zero tokens.
+    """
+    if not isinstance(check, dict):
+        raise WorkflowRuntimeError("gate() check must be a dict")
+    keys = set(check)
+    has_field = "field" in keys
+    has_equals = "equals" in keys
+    if has_field != has_equals:
+        raise WorkflowRuntimeError(
+            "gate() check 'field' requires 'equals' and vice versa"
+        )
+    if has_field:
+        if keys != {"field", "equals"}:
+            raise WorkflowRuntimeError(
+                "gate() check must use exactly one form: contains, not_contains, "
+                "regex, or field+equals"
+            )
+        field = check["field"]
+        if not isinstance(field, str) or not field.strip():
+            raise WorkflowRuntimeError("gate() check field must be a non-empty string")
+        return
+    if len(keys) != 1:
+        raise WorkflowRuntimeError(
+            "gate() check must use exactly one form: contains, not_contains, "
+            "regex, or field+equals"
+        )
+    kind = next(iter(keys))
+    if kind not in ("contains", "not_contains", "regex"):
+        raise WorkflowRuntimeError(
+            f"gate() unsupported check {kind!r}: expected contains, not_contains, "
+            "regex, or field+equals"
+        )
+    value = check[kind]
+    if not isinstance(value, str) or not value.strip():
+        raise WorkflowRuntimeError(f"gate() check {kind} must be a non-empty string")
+    if kind == "regex":
+        try:
+            re.compile(value)
+        except re.error as exc:
+            raise WorkflowRuntimeError(f"gate() check regex is invalid: {exc}") from exc
 
 
 def _check_vm_array_length(items: list[Any]) -> None:

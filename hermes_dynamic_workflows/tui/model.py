@@ -413,6 +413,14 @@ def _read_journal(raw_path: Any, reader: "_JsonlTailReader") -> dict[str, list[s
             text = "Result recorded"
         elif event_type == "error":
             text = f"Error: {_preview(value.get('error'), 90)}"
+        elif event_type == "gate":
+            verdict = str(value.get("verdict") or "?")
+            reason = value.get("reason")
+            text = (
+                f"GATE {verdict}: {_preview(reason, 90)}"
+                if reason
+                else f"GATE {verdict}"
+            )
         elif event_type == "activity" and value.get("activity"):
             text = str(value.get("activity"))
         else:

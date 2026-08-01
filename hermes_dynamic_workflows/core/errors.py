@@ -40,6 +40,17 @@ class ChildAgentSkipped(DynamicWorkflowError):
     """Raised internally when one child agent is intentionally skipped."""
 
 
+class GateBlocked(DynamicWorkflowError):
+    """Raised when a ``gate()`` quality gate blocks an agent result.
+
+    Recoverable (an ``Exception``): a workflow script may wrap ``gate()`` in
+    ``try/except Exception`` and degrade gracefully. The message names the
+    zero-token check or the LLM judge decision that blocked the result.
+    Deliberately NOT a ``WorkflowHalt`` — the run continues if the script
+    handles it.
+    """
+
+
 class WorkflowLaunchDenied(DynamicWorkflowError):
     """Raised when a top-level launch is not approved by the user (or no
     approval channel is available). The caller should tell the user, not retry."""
