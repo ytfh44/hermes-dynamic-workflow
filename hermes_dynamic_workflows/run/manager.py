@@ -35,6 +35,7 @@ from ..view.render import (
 from ..engine.runtime import WorkflowOptions, run_workflow
 from .transcripts import (
     LiveTranscriptExporter,
+    SessionTranscriptReader,
     _export_child_transcripts,
     _agent_session_id,
     _is_active_agent_snapshot,
@@ -69,10 +70,12 @@ class WorkflowRunManager:
         config: PluginConfig | None = None,
         *,
         enable_control: bool = False,
+        transcript_reader: SessionTranscriptReader | None = None,
     ):
         self.store = store or WorkflowStore()
         self.config = config or load_config()
         self.control_owner = new_control_owner()
+        self.transcript_reader = transcript_reader
         self._runs: dict[str, ManagedRun] = {}
         self._lock = threading.RLock()
         self._control_listener: ControlListener | None = None
@@ -652,7 +655,10 @@ class WorkflowRunManager:
                     }
                 )
             if targets and managed.transcript_exporter is None:
-                managed.transcript_exporter = LiveTranscriptExporter(run_id=managed.run_id)
+                managed.transcript_exporter = LiveTranscriptExporter(
+                    run_id=managed.run_id,
+                    reader=self.transcript_reader,
+                )
                 start_exporter = True
             exporter = managed.transcript_exporter
         if exporter is None:
