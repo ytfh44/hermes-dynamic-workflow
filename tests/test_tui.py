@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -523,6 +524,49 @@ class TuiTests(unittest.TestCase):
         self.assertEqual([request["action"] for request in control.requests], ["pause", "stop", "restart", "resume"])
         self.assertEqual(control.requests[0]["owner"], "fake-control-owner")
         self.assertIn("resume accepted", controller.state.message)
+
+    def test_save_run_concurrent_writes_use_unique_tmp_names(self):
+        """Concurrent save_run on the same run file must write distinct tmp
+        names; the final file holds one complete record and no tmp remains."""
+        with tempfile.TemporaryDirectory() as tmp:
+            store = _fake_store(Path(tmp))
+            run_id = "wf_unique123-tmp"
+            seen: list[str] = []
+            parked = threading.Barrier(2)
+            release = threading.Event()
+            errors: list[Exception] = []
+            original_write_text = Path.write_text
+
+            def parked_write_text(self, *args, **kwargs):
+                if self.name.startswith(run_id) and self.name.endswith(".tmp"):
+                    seen.append(self.name)
+                    parked.wait(timeout=5)
+                    release.wait(timeout=5)
+                return original_write_text(self, *args, **kwargs)
+
+            def saver(status: str) -> None:
+                try:
+                    store.save_run({"runId": run_id, "status": status})
+                except Exception as exc:
+                    errors.append(exc)
+
+            with patch("pathlib.Path.write_text", new=parked_write_text):
+                first = threading.Thread(target=saver, args=("running",))
+                second = threading.Thread(target=saver, args=("done",))
+                first.start()
+                second.start()
+                release.set()
+                first.join(timeout=10)
+                second.join(timeout=10)
+            self.assertFalse(first.is_alive())
+            self.assertFalse(second.is_alive())
+            self.assertEqual(len(seen), 2)
+            self.assertEqual(len(set(seen)), 2)
+            self.assertEqual(errors, [])
+            loaded = store.load_run(run_id)
+            self.assertIsNotNone(loaded)
+            self.assertIn(loaded["status"], {"running", "done"})
+            self.assertFalse(list(store.runs_dir.glob("*.tmp")))
 
 
 def _fake_store(root: Path) -> WorkflowStore:

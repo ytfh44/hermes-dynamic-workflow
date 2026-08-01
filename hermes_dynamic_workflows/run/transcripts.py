@@ -12,6 +12,8 @@ import hashlib
 import json
 import os
 import threading
+import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -609,10 +611,28 @@ def _write_json_atomic(path: Path, value: Any) -> None:
 
 
 def _write_text_atomic(path: Path, text: str) -> None:
+    """Atomically write text to path via a uniquely-named tmp + rename.
+
+    The unique tmp name keeps concurrent writers of the same path from
+    clobbering each other's in-flight tmp file; if the write or rename fails,
+    the leftover tmp is removed so no residue remains. The rename is retried a
+    few times because on Windows a concurrent replace of the same target can
+    transiently fail with ERROR_ACCESS_DENIED.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.tmp")
-    tmp.write_text(text, encoding="utf-8")
-    tmp.replace(path)
+    tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex[:8]}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        for attempt in range(3):
+            try:
+                tmp.replace(path)
+                break
+            except OSError:
+                if attempt == 2:
+                    raise
+                time.sleep(0.01)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _json_signature(value: Any) -> str:

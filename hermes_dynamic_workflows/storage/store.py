@@ -34,6 +34,35 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+_REPLACE_RETRIES = 3
+_REPLACE_RETRY_DELAY_SECONDS = 0.01
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    """Atomically write text to path via a uniquely-named tmp + rename.
+
+    The unique tmp name keeps concurrent writers of the same path (e.g. two
+    processes saving the same run, or the version counter racing a save) from
+    clobbering each other's in-flight tmp file; if the write or rename fails,
+    the leftover tmp is removed so no residue remains. The rename is retried a
+    few times because on Windows a concurrent replace of the same target can
+    transiently fail with ERROR_ACCESS_DENIED.
+    """
+    tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex[:8]}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        for attempt in range(_REPLACE_RETRIES):
+            try:
+                tmp.replace(path)
+                break
+            except OSError:
+                if attempt == _REPLACE_RETRIES - 1:
+                    raise
+                time.sleep(_REPLACE_RETRY_DELAY_SECONDS)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def new_run_id() -> str:
     raw = uuid.uuid4().hex
     return f"wf_{raw[:8]}-{raw[8:11]}"
@@ -115,9 +144,10 @@ class WorkflowStore:
     def save_run(self, record: dict[str, Any]) -> None:
         run_id = str(record.get("runId") or "")
         path = self.run_path(run_id)
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-        tmp.replace(path)
+        _write_text_atomic(
+            path,
+            json.dumps(record, ensure_ascii=False, indent=2, default=str),
+        )
         self._bump_version()
 
     def world_version(self) -> int:
@@ -144,9 +174,7 @@ class WorkflowStore:
 
     def _write_version(self, version: int) -> None:
         """Atomically persist the version via tmp+rename."""
-        tmp = self.runs_dir / ".version.tmp"
-        tmp.write_text(str(version), encoding="utf-8")
-        tmp.replace(self._version_path())
+        _write_text_atomic(self._version_path(), str(version))
 
     def _bump_version(self) -> int:
         """Compute and persist the next strictly-larger version, returning it.

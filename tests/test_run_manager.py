@@ -1522,6 +1522,65 @@ return await agent("do it", {"label": "worker"})
         self.assertEqual(final["status"], "completed")
         self.assertEqual(final["result"], "1:worker")
 
+    def test_atomic_text_write_uses_unique_tmp_under_concurrency(self):
+        """Concurrent atomic writes to the same path must use distinct tmp
+        names; the final file holds one complete payload and no tmp remains."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "agent-duel.jsonl"
+            seen: list[str] = []
+            parked = threading.Barrier(2)
+            release = threading.Event()
+            errors: list[Exception] = []
+            original_write_text = Path.write_text
+
+            def parked_write_text(self, *args, **kwargs):
+                if self.name.endswith(".tmp"):
+                    seen.append(self.name)
+                    parked.wait(timeout=5)
+                    release.wait(timeout=5)
+                return original_write_text(self, *args, **kwargs)
+
+            def writer(payload: str) -> None:
+                try:
+                    transcripts_module._write_text_atomic(target, payload)
+                except Exception as exc:
+                    errors.append(exc)
+
+            with patch("pathlib.Path.write_text", new=parked_write_text):
+                first = threading.Thread(target=writer, args=("payload-A\n",))
+                second = threading.Thread(target=writer, args=("payload-B\n",))
+                first.start()
+                second.start()
+                release.set()
+                first.join(timeout=10)
+                second.join(timeout=10)
+            self.assertFalse(first.is_alive())
+            self.assertFalse(second.is_alive())
+            self.assertEqual(len(seen), 2)
+            self.assertEqual(len(set(seen)), 2)
+            self.assertEqual(errors, [])
+            self.assertIn(
+                target.read_text(encoding="utf-8"),
+                {"payload-A\n", "payload-B\n"},
+            )
+            self.assertFalse(list(root.glob("*.tmp")))
+
+    def test_atomic_text_write_failure_removes_tmp(self):
+        """A failed atomic write (after the tmp was written) must not leave a
+        tmp file behind."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "agent-explode.jsonl"
+
+            def exploding_replace(self, target, *args, **kwargs):
+                raise OSError("rename failed")
+
+            with patch("pathlib.Path.replace", new=exploding_replace):
+                with self.assertRaises(OSError):
+                    transcripts_module._write_text_atomic(target, "data\n")
+            self.assertFalse(list(root.glob("*.tmp")))
+
 
 if __name__ == "__main__":
     unittest.main()
