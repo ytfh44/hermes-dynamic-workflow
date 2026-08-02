@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import inspect
-import json
 import re
 import threading
 from pathlib import Path
@@ -14,6 +13,11 @@ from typing import Any, Callable
 
 from .cache import agent_fingerprint, is_cache_miss
 from .fingerprint import resolve_fingerprint
+from .gate_logic import (
+    _gate_check_description,
+    _gate_checks_pass,
+    _gate_text,
+)
 from ..core.text import preview
 from ..core.errors import (
     ChildAgentError,
@@ -801,50 +805,6 @@ def _validate_fingerprint_opts(opts: dict[str, Any]) -> None:
             raise WorkflowRuntimeError(
                 "agent() ttl_seconds option must be a positive number"
             )
-
-
-def _gate_text(result: Any) -> str:
-    """Render an agent result as text for the text-based zero-token checks.
-
-    Strings pass through; structured results are JSON-serialized so
-    ``contains`` / ``not_contains`` / ``regex`` can inspect them.
-    """
-    if isinstance(result, str):
-        return result
-    if isinstance(result, (dict, list)):
-        return json.dumps(result, ensure_ascii=False, sort_keys=True)
-    return str(result)
-
-
-def _gate_checks_pass(check: dict[str, Any], result: Any) -> bool:
-    """Return True when ``result`` satisfies the (already validated) ``check``.
-
-    ``contains`` / ``not_contains`` / ``regex`` match against the text form of
-    the result; ``field`` + ``equals`` compares a key of a structured-output
-    dict. A missing field or a non-dict result fails the check.
-    """
-    if "contains" in check:
-        return check["contains"] in _gate_text(result)
-    if "not_contains" in check:
-        return check["not_contains"] not in _gate_text(result)
-    if "regex" in check:
-        return re.search(check["regex"], _gate_text(result)) is not None
-    return (
-        isinstance(result, dict)
-        and check["field"] in result
-        and result[check["field"]] == check["equals"]
-    )
-
-
-def _gate_check_description(check: dict[str, Any]) -> str:
-    """Human-readable summary of a check, used in the ``GateBlocked`` message."""
-    if "contains" in check:
-        return f"contains {check['contains']!r}"
-    if "not_contains" in check:
-        return f"not_contains {check['not_contains']!r}"
-    if "regex" in check:
-        return f"regex {check['regex']!r}"
-    return f"field {check['field']!r} equals {check['equals']!r}"
 
 
 def _validate_gate_check(check: Any) -> None:

@@ -154,9 +154,11 @@ return results
             # Both agents share the same fingerprint, so under content
             # addressing their results are interchangeable: either both ran
             # (a:same + b:same) or the second hit the first's cache entry.
+            # Both outcomes are valid and depend on scheduling, so each
+            # result must merely be one of the two interchangeable values.
             self.assertEqual(len(result.value), 2)
-            self.assertEqual(result.value[0], result.value[1])
             self.assertIn(result.value[0], ("a:same", "b:same"))
+            self.assertIn(result.value[1], ("a:same", "b:same"))
             self.assertEqual(list(store.cache_dir.glob("*.tmp")), [])
 
     def test_cache_store_hit_precedes_and_spares_resume_cache(self):
