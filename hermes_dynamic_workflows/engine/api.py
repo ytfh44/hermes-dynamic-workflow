@@ -9,10 +9,11 @@ import json
 import re
 import threading
 from pathlib import Path
-from time import monotonic
+from time import monotonic, time
 from typing import Any, Callable
 
 from .cache import agent_fingerprint, is_cache_miss
+from .fingerprint import resolve_fingerprint
 from ..core.text import preview
 from ..core.errors import (
     ChildAgentError,
@@ -153,6 +154,48 @@ class WorkflowAPI:
             },
         )
         journal_key = f"v2:{fingerprint}"
+        cache_store = getattr(self.context, "cache_store", None)
+        cache_key = None
+        fingerprint_entries: list[str] | None = opts.get("fingerprint")
+        if cache_store is not None and fingerprint_entries is not None:
+            try:
+                user_fp = resolve_fingerprint(fingerprint_entries, self.frame.cwd)
+                cache_key = agent_fingerprint(
+                    prompt,
+                    {
+                        "schema": schema,
+                        **resolved.cache_inputs(),
+                        "userFingerprint": user_fp,
+                    },
+                )
+                ttl_ms = opts.get("ttl_seconds")
+                if isinstance(ttl_ms, (int, float)) and not isinstance(ttl_ms, bool):
+                    ttl_ms = ttl_ms * 1000
+                else:
+                    ttl_ms = None
+                cached = cache_store.get(cache_key, ttl_ms=ttl_ms)
+                if cached is not None:
+                    record.status = "done"
+                    record.result_preview = f"(cached) {preview(cached, 170)}"
+                    if schema:
+                        record.structured = {"status": "cached", "mode": "tool", "attempts": 0}
+                    record.started_at = monotonic()
+                    record.ended_at = record.started_at
+                    self._journal(
+                        {
+                            "type": "result",
+                            "key": f"cache:{cache_key}",
+                            "agentId": str(agent_id),
+                            "cached": True,
+                            "result": cached,
+                        }
+                    )
+                    self._notify()
+                    return cached
+            except Exception:
+                # A cache failure must never abort the run; fall through to the
+                # normal resume-cache/live path as if the store had missed.
+                cache_key = None
         cached = self.resume_cache.get(fingerprint)
         if not is_cache_miss(cached):
             record.status = "done"
@@ -267,6 +310,17 @@ class WorkflowAPI:
                 record.tokens = accumulated_tokens
                 record.result_preview = preview(result, 180)
                 self.resume_cache.put(fingerprint, result)
+                if cache_key is not None and cache_store is not None:
+                    try:
+                        cache_store.put(
+                            {
+                                "key": cache_key,
+                                "createdAt": time() * 1000,
+                                "result": result,
+                            }
+                        )
+                    except Exception:
+                        pass
                 self._journal(
                     {
                         "type": "result",
@@ -686,22 +740,67 @@ _PUBLIC_AGENT_OPT_KEYS = frozenset(
         "model",
         "isolation",
         "agentType",
+        "fingerprint",
+        "ttl_seconds",
     }
 )
+
+# Prefixes accepted in a fingerprint entry; anything else is rejected here so a
+# typo cannot silently cache under a bogus key. resolve_fingerprint itself is
+# total and would degrade an unknown prefix to a sentinel instead.
+_FINGERPRINT_ENTRY_PREFIXES = ("git:", "file:", "glob:", "glob!:", "env:")
 
 
 def _validate_agent_opts(opts: dict[str, Any]) -> None:
     unknown = sorted(str(key) for key in opts if str(key) not in _PUBLIC_AGENT_OPT_KEYS)
     if not unknown:
+        _validate_fingerprint_opts(opts)
         return
     raise WorkflowRuntimeError(
         "unsupported agent() option(s): "
         + ", ".join(unknown)
         + ". Public workflow agent options are label, phase, schema, model, "
-        "isolation, and agentType. Put tool access in agentType presets or "
-        "plugin config; provider/runtime, timeout, and retry policy belong in "
-        "Hermes/plugin configuration, not workflow scripts."
+        "isolation, agentType, fingerprint, and ttl_seconds. Put tool access in "
+        "agentType presets or plugin config; provider/runtime, timeout, and "
+        "retry policy belong in Hermes/plugin configuration, not workflow "
+        "scripts."
     )
+
+
+def _validate_fingerprint_opts(opts: dict[str, Any]) -> None:
+    """Validate the cross-run cache options (``fingerprint``/``ttl_seconds``).
+
+    ``fingerprint`` must be a non-empty list of non-empty strings, each with a
+    known prefix (``git:``, ``file:``, ``glob:``, ``glob!:``, or ``env:``);
+    ``ttl_seconds``, when present, must be a positive number. Any violation
+    raises ``WorkflowRuntimeError`` before a child agent is spawned.
+    """
+    fingerprint = opts.get("fingerprint")
+    if fingerprint is not None:
+        if not isinstance(fingerprint, list) or not fingerprint:
+            raise WorkflowRuntimeError(
+                "agent() fingerprint option must be a non-empty list of entry strings"
+            )
+        for entry in fingerprint:
+            if not isinstance(entry, str) or not entry.strip():
+                raise WorkflowRuntimeError(
+                    "agent() fingerprint entries must be non-empty strings"
+                )
+            if not entry.startswith(_FINGERPRINT_ENTRY_PREFIXES):
+                raise WorkflowRuntimeError(
+                    "agent() fingerprint entry has an unsupported prefix: "
+                    f"{entry!r} (expected git:, file:, glob:, glob!:, or env:)"
+                )
+    if "ttl_seconds" in opts:
+        ttl_seconds = opts.get("ttl_seconds")
+        if (
+            isinstance(ttl_seconds, bool)
+            or not isinstance(ttl_seconds, (int, float))
+            or ttl_seconds <= 0
+        ):
+            raise WorkflowRuntimeError(
+                "agent() ttl_seconds option must be a positive number"
+            )
 
 
 def _gate_text(result: Any) -> str:

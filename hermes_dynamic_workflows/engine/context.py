@@ -79,6 +79,7 @@ class WorkflowExecutionContext:
     plugin_context: Any = None
     token_budget_total: int | None = None
     store: Any = None
+    cache_store: Any = None
     state: WorkflowState = field(init=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, init=False)
     _agent_slots: threading.BoundedSemaphore = field(init=False)

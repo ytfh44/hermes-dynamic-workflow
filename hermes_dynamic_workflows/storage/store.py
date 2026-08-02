@@ -80,7 +80,8 @@ class WorkflowStore:
         self.scripts_dir = self.root / "scripts"
         self.workflows_dir = self.root / "workflows"
         self.exports_dir = self.root / "exports"
-        for path in (self.root, self.runs_dir, self.scripts_dir, self.workflows_dir, self.exports_dir):
+        self.cache_dir = self.root / "cache"
+        for path in (self.root, self.runs_dir, self.scripts_dir, self.workflows_dir, self.exports_dir, self.cache_dir):
             path.mkdir(parents=True, exist_ok=True)
 
     def run_path(self, run_id: str) -> Path:

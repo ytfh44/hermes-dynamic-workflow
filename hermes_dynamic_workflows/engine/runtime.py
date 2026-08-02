@@ -45,6 +45,7 @@ class WorkflowOptions:
     plugin_context: Any = None
     token_budget_total: int | None = None
     store: Any = None
+    cache_store: Any = None
 
 
 @dataclass
@@ -141,6 +142,7 @@ async def _run_workflow_async(script: str, options: WorkflowOptions | None = Non
             plugin_context=options.plugin_context,
             token_budget_total=options.token_budget_total,
             store=options.store,
+            cache_store=options.cache_store,
         )
         frame = root
     else:
