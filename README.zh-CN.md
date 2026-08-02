@@ -82,7 +82,8 @@ return await agent("Synthesize the verified findings:\n" + json.dumps(findings))
 
 - `agent(prompt, opts)` 起一个子代理；`opts` 可带 `schema`（强制结构化输出）、`model`、
   `agentType`、`isolation="worktree"`。
-- `pipeline`（默认，无栅栏）/ `parallel`（栅栏）做并发；`phase`/`log` 报告进度；
+- `pipeline`（默认，无栅栏）/ `parallel`（栅栏）做并发；`map(items, thunk)` 按输入序把 thunk 扇出到运行时集合；
+  `gate(prompt, opts)` 对子代理结果做质量门（零 token `check` 或 LLM `judge`，fail-closed）；`phase`/`log` 报告进度；
   `workflow()` 内联跑命名工作流；`args` / `budget` 取入参与 token 预算。
 
 ### Agent Type

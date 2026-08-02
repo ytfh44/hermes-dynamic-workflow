@@ -45,6 +45,8 @@ required; `whenToUse` and `phases` optional).
 | `agent` | `await agent(prompt, opts=None)` | Spawns a subagent. Without a schema it returns text; with `schema` it returns the validated object. `opts`: `label` `phase` `schema` `model` `isolation` `agentType`. Returns `None` if skipped by the user. |
 | `pipeline` | `await pipeline(items, stage1, …)` | Each item flows through the stages independently, **no barrier**. Stage callbacks receive `(prev, original, index)`; if a stage throws → that item becomes `None`. The default for multi-stage work. |
 | `parallel` | `await parallel(thunks)` | Runs concurrently, **with a barrier**: returns only once all complete. A single failure → `None` in the results (the whole call does not throw). |
+| `map` | `await map(items, thunk)` | Fans a thunk over a runtime collection; results in input order (barrier, same failure semantics as `parallel`). `thunk(item, index)` typically returns `await agent(...)`. |
+| `gate` | `await gate(prompt, opts)` | `agent()` plus a quality gate: `check` (zero-token `contains`/`not_contains`/`regex`/`field`+`equals`) or `judge: True` (LLM verdict, fail-closed). Failure raises recoverable `GateBlocked`. |
 | `phase` | `phase(title)` | Starts a progress group. |
 | `log` | `log(message)` | Sends a line of progress to the user. |
 | `workflow` | `await workflow(name_or_ref, args=None)` | Runs another workflow inline, sharing concurrency/counts/stop/budget; one level of nesting only. |

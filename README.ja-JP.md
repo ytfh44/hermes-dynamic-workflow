@@ -92,6 +92,8 @@ return await agent("検証済みの結果を統合する:\n" + json.dumps(findin
 - `agent(prompt, opts)` は子エージェントを起動します。`opts` には `schema`（構造化出力を強制）、
   `model`、`agentType`、`isolation="worktree"` を含めることができます。
 - `pipeline`（デフォルト、バリアなし）／`parallel`（バリアあり）が並行処理を扱います。
+  `map(items, thunk)` は実行時コレクションへ thunk を入力順にファンアウトし、`gate(prompt, opts)` は
+  子エージェント結果に品質ゲートを適用します（ゼロトークン `check` または LLM `judge`、fail-closed）。
   `phase`／`log` は進捗を報告し、`workflow()` は名前付きワークフローをインラインで実行し、`args` /
   `budget` は入力引数とトークン予算にアクセスします。
 

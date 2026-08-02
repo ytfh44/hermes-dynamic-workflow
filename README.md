@@ -91,8 +91,11 @@ return await agent("Synthesize the verified findings:\n" + json.dumps(findings))
 - `agent(prompt, opts)` spawns a child agent; `opts` may include `schema` (enforce
   structured output), `model`, `agentType`, and `isolation="worktree"`.
 - `pipeline` (default, no barrier) / `parallel` (with barrier) handle concurrency;
-  `phase`/`log` report progress; `workflow()` runs a named workflow inline; `args` /
-  `budget` access the input arguments and the token budget.
+  `map(items, thunk)` fans a thunk over a runtime collection in input order;
+  `gate(prompt, opts)` enforces a quality gate on a child result (zero-token
+  `check` or LLM `judge`, fail-closed); `phase`/`log` report progress; `workflow()`
+  runs a named workflow inline; `args` / `budget` access the input arguments and
+  the token budget.
 
 ### Agent Type
 
