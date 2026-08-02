@@ -71,6 +71,7 @@ class WorkflowAPI:
             "agent": self.agent,
             "gate": self.gate,
             "parallel": self.parallel,
+            "map": self.map,
             "pipeline": self.pipeline,
             "phase": self.phase,
             "log": self.log,
@@ -519,6 +520,47 @@ class WorkflowAPI:
         )
         self._check_deadline()
         return results
+
+    async def map(self, items: Any, thunk: Callable[[Any, int], Any]) -> list[Any]:
+        """Map a thunk over every item of a collection, collecting results in order.
+
+        ``map(items, thunk)`` runs ``thunk(item, index)`` concurrently for every
+        item of ``items`` and returns the collected results in input order. A
+        thunk usually awaits ``agent()`` or ``gate()`` and returns its result,
+        but it may return any value (an awaitable is awaited transparently).
+
+        ``items`` may be any iterable; it is materialized with ``list()`` before
+        being validated, so generators and tuples are accepted. A non-iterable
+        ``items`` or a non-callable ``thunk`` raises a ``WorkflowRuntimeError``.
+        The empty collection returns an empty list and never invokes ``thunk``.
+        The list length is guarded by the VM array-length limit.
+
+        Concurrency is governed by the same global agent slot that bounds
+        ``parallel()``; no per-map limit is applied, so a map never launches
+        more child agents concurrently than the configured global cap.
+
+        Failure semantics match ``parallel()``: a ``WorkflowHalt`` propagates
+        immediately; any other exception is logged (as ``parallel[i] failed``,
+        because the thunks are executed through ``parallel()``), recorded on the
+        frame unless it is a ``ChildAgentError``, and replaced with ``None`` in
+        the result list so a single failing item does not abort the run.
+        """
+        self._check_deadline()
+        try:
+            items = list(items)
+        except TypeError as exc:
+            raise WorkflowRuntimeError("map() expects an iterable as the first argument") from exc
+        if not callable(thunk):
+            raise WorkflowRuntimeError("map() expects a callable as the second argument")
+        _check_vm_array_length(items)
+        if not items:
+            return []
+
+        thunks: list[Callable[[], Any]] = [
+            lambda item=item, idx=idx: thunk(item, idx)
+            for idx, item in enumerate(items)
+        ]
+        return await self.parallel(thunks)
 
     async def _run_parallel_thunk(self, index: int, thunk: Callable[[], Any]) -> Any:
         try:
